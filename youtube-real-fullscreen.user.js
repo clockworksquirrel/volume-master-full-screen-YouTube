@@ -11,9 +11,9 @@
 // @connect      127.0.0.1
 // @run-at       document-start
 // @noframes
-// @homepageURL  https://github.com/clockworksquirrel/volume-master-fullscreen
-// @downloadURL  https://raw.githubusercontent.com/clockworksquirrel/volume-master-fullscreen/main/youtube-real-fullscreen.user.js
-// @updateURL    https://raw.githubusercontent.com/clockworksquirrel/volume-master-fullscreen/main/youtube-real-fullscreen.user.js
+// @homepageURL  https://github.com/clockworksquirrel/volume-master-full-screen-YouTube
+// @downloadURL  https://raw.githubusercontent.com/clockworksquirrel/volume-master-full-screen-YouTube/main/youtube-real-fullscreen.user.js
+// @updateURL    https://raw.githubusercontent.com/clockworksquirrel/volume-master-full-screen-YouTube/main/youtube-real-fullscreen.user.js
 // ==/UserScript==
 
 (() => {
