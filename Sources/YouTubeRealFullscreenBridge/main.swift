@@ -7,8 +7,12 @@ import OSLog
 
 private let bridgePort: NWEndpoint.Port = 38_471
 private let bridgeToken = "792c7cdbaa0561ce2e0f2534d75b7d5aa689a7648f41d3b6dde476ff23a6af5a"
-private let heliumBundleIdentifier = "net.imput.helium"
 private let axFullScreenAttribute = "AXFullScreen"
+private let axIdentifierAttribute = "AXIdentifier"
+private let axWebAreaRole = "AXWebArea"
+private let maximumAccessibilityElements = 1_200
+private let maximumAccessibilityDepth = 18
+private let captureEvidenceStabilityNanoseconds: UInt64 = 250_000_000
 private let logger = Logger(
     subsystem: "local.codex.youtube-real-fullscreen",
     category: "bridge"
@@ -20,9 +24,16 @@ private struct ActionResult {
     let message: String
 }
 
+private struct BrowserWindowSnapshot {
+    var documentURL: String?
+    var chromeElements: [BrowserChromeElement]
+}
+
 @MainActor
 private final class FullscreenController {
+    private var forcedWindow: AXUIElement?
     private var forcedPID: pid_t?
+    private var forcedBrowserName: String?
     private var permissionPrompted = false
 
     func probe() -> [String: Any] {
@@ -30,29 +41,67 @@ private final class FullscreenController {
             return ["frontmost": NSNull(), "trusted": AXIsProcessTrusted()]
         }
 
+        let engine = browserEngine(for: application)
         var result: [String: Any] = [
             "frontmost": application.bundleIdentifier ?? application.localizedName ?? "unknown",
+            "engine": engine?.rawValue ?? NSNull(),
             "pid": application.processIdentifier,
             "trusted": AXIsProcessTrusted(),
         ]
 
-        if let window = focusedWindow(for: application.processIdentifier) {
-            let title = stringAttribute(kAXTitleAttribute, of: window)
-            result["windowTitle"] = title ?? NSNull()
-            result["shared"] = isSharedTabWindowTitle(title)
+        if AXIsProcessTrusted(),
+           let engine,
+           let window = focusedWindow(for: application.processIdentifier)
+        {
+            let snapshot = inspectBrowserWindow(window)
+            let decision = evaluateBridgePolicy(
+                engine: engine,
+                documentURL: snapshot.documentURL,
+                chromeElements: snapshot.chromeElements
+            )
+            let sharingCandidates = snapshot.chromeElements
+                .filter(isBrowserChromeSharingIndicator)
+                .map { element in
+                    [
+                        "role": element.role,
+                        "identifier": element.identifier ?? "",
+                        "text": element.text,
+                        "selectedTab": element.isWithinSelectedTab,
+                    ] as [String: Any]
+                }
+            let tabCandidates = snapshot.chromeElements
+                .filter { $0.role == "AXTab" || $0.role == "AXRadioButton" }
+                .map { element in
+                    [
+                        "role": element.role,
+                        "identifier": element.identifier ?? "",
+                        "text": element.text,
+                        "selectedTab": element.isWithinSelectedTab,
+                    ] as [String: Any]
+                }
+            result["documentURL"] = snapshot.documentURL ?? NSNull()
+            result["sharingIndicator"] = decision.evidence != nil
+            result["sharingCandidates"] = sharingCandidates
+            result["tabCandidates"] = tabCandidates
+            result["policyMessage"] = decision.message
             result["fullscreen"] = boolAttribute(axFullScreenAttribute, of: window) ?? NSNull()
         }
 
         return result
     }
 
-    func enter() -> ActionResult {
+    func enter(pageHost: String?) async -> ActionResult {
+        guard isYouTubeHost(pageHost) else {
+            return ActionResult(status: 403, changed: false, message: "The request did not come from a YouTube page.")
+        }
+
         guard let application = NSWorkspace.shared.frontmostApplication,
-              application.bundleIdentifier == heliumBundleIdentifier else {
+              let engine = browserEngine(for: application)
+        else {
             return ActionResult(
                 status: 409,
                 changed: false,
-                message: "Helium is not the frontmost application."
+                message: "The frontmost application is not a supported Chromium- or Gecko-based browser."
             )
         }
 
@@ -66,54 +115,91 @@ private final class FullscreenController {
 
         let pid = application.processIdentifier
         guard let window = focusedWindow(for: pid) else {
-            return ActionResult(status: 409, changed: false, message: "No focused Helium window was found.")
+            return ActionResult(status: 409, changed: false, message: "No focused browser window was found.")
         }
 
-        let title = stringAttribute(kAXTitleAttribute, of: window)
-        guard shouldApplyFullscreenBridge(
-            bundleIdentifier: application.bundleIdentifier,
-            windowTitle: title
-        ) else {
-            return ActionResult(status: 200, changed: false, message: "The active tab is not being shared.")
+        let snapshot = inspectBrowserWindow(window)
+        let decision = evaluateBridgePolicy(
+            engine: engine,
+            documentURL: snapshot.documentURL,
+            chromeElements: snapshot.chromeElements
+        )
+        guard decision.allowed else {
+            return ActionResult(status: 200, changed: false, message: decision.message)
+        }
+
+        // A browser can remove its sharing badge shortly after capture stops.
+        // Require the selected-tab evidence to survive a second observation so
+        // a stale accessibility update cannot authorize fullscreen.
+        try? await Task.sleep(nanoseconds: captureEvidenceStabilityNanoseconds)
+        let stableSnapshot = inspectBrowserWindow(window)
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+              evaluateBridgePolicy(
+                  engine: engine,
+                  documentURL: stableSnapshot.documentURL,
+                  chromeElements: stableSnapshot.chromeElements
+              ).allowed
+        else {
+            return ActionResult(
+                status: 200,
+                changed: false,
+                message: "The selected tab's sharing indicator did not remain active."
+            )
         }
 
         if boolAttribute(axFullScreenAttribute, of: window) == true {
-            return ActionResult(status: 200, changed: false, message: "The Helium window is already fullscreen.")
+            return ActionResult(status: 200, changed: false, message: "The browser window is already fullscreen.")
         }
 
         guard setFullscreen(true, on: window) else {
-            return ActionResult(status: 500, changed: false, message: "Helium rejected the native fullscreen request.")
+            return ActionResult(status: 500, changed: false, message: "The browser rejected the native fullscreen request.")
         }
 
+        forcedWindow = window
         forcedPID = pid
-        logger.info("Entered native fullscreen for a shared Helium tab")
+        forcedBrowserName = application.localizedName ?? application.bundleIdentifier
+        logger.info(
+            "Entered native fullscreen for a shared YouTube tab in \(self.forcedBrowserName ?? "browser", privacy: .public)"
+        )
         return ActionResult(status: 200, changed: true, message: "Entered native fullscreen.")
     }
 
     func exit() -> ActionResult {
-        guard let pid = forcedPID else {
+        guard let window = forcedWindow else {
             return ActionResult(status: 200, changed: false, message: "This bridge did not enter fullscreen.")
         }
 
-        guard ensureAccessibilityPermission(),
-              let window = focusedWindow(for: pid)
+        guard ensureAccessibilityPermission() else {
+            return ActionResult(status: 503, changed: false, message: "Accessibility permission is unavailable.")
+        }
+
+        var currentPID: pid_t = 0
+        guard AXUIElementGetPid(window, &currentPID) == .success,
+              currentPID == forcedPID
         else {
-            forcedPID = nil
-            return ActionResult(status: 200, changed: false, message: "The original Helium window is no longer available.")
+            clearForcedWindow()
+            return ActionResult(status: 200, changed: false, message: "The original browser window is no longer available.")
         }
 
         if boolAttribute(axFullScreenAttribute, of: window) != true {
-            forcedPID = nil
-            return ActionResult(status: 200, changed: false, message: "The Helium window already left fullscreen.")
+            clearForcedWindow()
+            return ActionResult(status: 200, changed: false, message: "The browser window already left fullscreen.")
         }
 
         guard setFullscreen(false, on: window) else {
-            return ActionResult(status: 500, changed: false, message: "Helium rejected the fullscreen exit request.")
+            return ActionResult(status: 500, changed: false, message: "The browser rejected the fullscreen exit request.")
         }
 
-        forcedPID = nil
-        logger.info("Restored the Helium window after page fullscreen ended")
+        let browserName = forcedBrowserName ?? "browser"
+        clearForcedWindow()
+        logger.info("Restored the \(browserName, privacy: .public) window after page fullscreen ended")
         return ActionResult(status: 200, changed: true, message: "Exited native fullscreen.")
+    }
+
+    private func clearForcedWindow() {
+        forcedWindow = nil
+        forcedPID = nil
+        forcedBrowserName = nil
     }
 
     private func ensureAccessibilityPermission() -> Bool {
@@ -131,6 +217,30 @@ private final class FullscreenController {
         return false
     }
 
+    private func browserEngine(for application: NSRunningApplication) -> BrowserEngine? {
+        var frameworkNames: [String] = []
+        var hasXULRuntime = false
+
+        if let bundleURL = application.bundleURL {
+            let frameworksURL = bundleURL.appendingPathComponent("Contents/Frameworks", isDirectory: true)
+            frameworkNames = (try? FileManager.default.contentsOfDirectory(
+                at: frameworksURL,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ).map(\.lastPathComponent)) ?? []
+
+            hasXULRuntime = FileManager.default.fileExists(
+                atPath: bundleURL.appendingPathComponent("Contents/MacOS/XUL").path
+            )
+        }
+
+        return detectBrowserEngine(
+            bundleIdentifier: application.bundleIdentifier,
+            frameworkNames: frameworkNames,
+            hasXULRuntime: hasXULRuntime
+        )
+    }
+
     private func focusedWindow(for pid: pid_t) -> AXUIElement? {
         let application = AXUIElementCreateApplication(pid)
         var value: CFTypeRef?
@@ -146,12 +256,98 @@ private final class FullscreenController {
         return (value as! AXUIElement)
     }
 
+    private func inspectBrowserWindow(_ window: AXUIElement) -> BrowserWindowSnapshot {
+        var snapshot = BrowserWindowSnapshot(
+            documentURL: stringAttribute(kAXDocumentAttribute, of: window),
+            chromeElements: []
+        )
+        var visited = 0
+
+        func visit(_ element: AXUIElement, depth: Int, withinSelectedTab: Bool) {
+            guard depth <= maximumAccessibilityDepth,
+                  visited < maximumAccessibilityElements
+            else {
+                return
+            }
+            visited += 1
+
+            let role = stringAttribute(kAXRoleAttribute, of: element) ?? ""
+            if role == axWebAreaRole {
+                if snapshot.documentURL == nil {
+                    snapshot.documentURL = stringAttribute(kAXURLAttribute, of: element)
+                        ?? stringAttribute(kAXDocumentAttribute, of: element)
+                }
+                // Never inspect page-owned descendants. Sharing evidence must come
+                // from trusted browser chrome, not text controlled by a website.
+                return
+            }
+
+            let isTabElement = role == "AXTab" || role == "AXRadioButton"
+            let isSelectedTab = boolAttribute(kAXSelectedAttribute, of: element) == true
+                || boolAttribute(kAXValueAttribute, of: element) == true
+            let selectedTabBranch = withinSelectedTab
+                || (isTabElement && isSelectedTab)
+
+            if depth > 0 {
+                let text = [
+                    stringAttribute(kAXTitleAttribute, of: element),
+                    stringAttribute(kAXDescriptionAttribute, of: element),
+                    stringAttribute(kAXHelpAttribute, of: element),
+                    stringAttribute(kAXValueAttribute, of: element),
+                ]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+
+                snapshot.chromeElements.append(BrowserChromeElement(
+                    role: role,
+                    identifier: stringAttribute(axIdentifierAttribute, of: element),
+                    text: text,
+                    isWithinSelectedTab: selectedTabBranch
+                ))
+            }
+
+            for child in children(of: element) {
+                visit(child, depth: depth + 1, withinSelectedTab: selectedTabBranch)
+                if visited >= maximumAccessibilityElements {
+                    break
+                }
+            }
+        }
+
+        visit(window, depth: 0, withinSelectedTab: false)
+        return snapshot
+    }
+
+    private func children(of element: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXChildrenAttribute as CFString,
+            &value
+        ) == .success,
+        let children = value as? [AXUIElement]
+        else {
+            return []
+        }
+        return children
+    }
+
     private func stringAttribute(_ attribute: String, of element: AXUIElement) -> String? {
         var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+              let value
+        else {
             return nil
         }
-        return value as? String
+
+        if let string = value as? String {
+            return string
+        }
+        if let url = value as? URL {
+            return url.absoluteString
+        }
+        return nil
     }
 
     private func boolAttribute(_ attribute: String, of element: AXUIElement) -> Bool? {
@@ -276,7 +472,7 @@ private final class BridgeServer {
                 let result: ActionResult
                 switch route {
                 case .enter:
-                    result = self.controller.enter()
+                    result = await self.controller.enter(pageHost: request.header("x-yrf-page-host"))
                 case .exit:
                     result = self.controller.exit()
                 case .health:
