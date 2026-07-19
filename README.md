@@ -1,4 +1,4 @@
-# Volume Master Fullscreen
+# volume-master-full-screen-YouTube
 
 Restore true macOS fullscreen for YouTube while a Chromium- or Gecko-family browser is actively sharing the selected tab.
 
