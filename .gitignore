@@ -1,5 +1,5 @@
 .build/
 .codex/
+graphify-out/
 .DS_Store
 *.zip.new
-
