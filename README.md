@@ -48,6 +48,14 @@ Some Gecko forks can nevertheless accept extensions that request a Chromium-comp
 
 The Gecko bridge path applies only when Firefox or a Gecko-derived browser exposes a browser-owned sharing marker on the selected tab. If the browser permits native DOM fullscreen while boosted audio is active, the helper should perform a no-op and let the browser's normal fullscreen path continue. A volume booster that only inserts a Web Audio gain node, or a fork that does not expose sharing state through Accessibility, also produces a deliberate no-op.
 
+### Firefox, Gecko, and Firefox forks
+
+**You don't need this if you're in modern versions of Firefox.**
+
+Modern Firefox normally allows YouTube to enter genuine native fullscreen while boosted audio is active, so there is no blocked native-window transition for this project to repair. The same is true of modern Gecko-based forks when they preserve Firefox's fullscreen behavior; Twilight 1.22t was tested and entered native YouTube fullscreen with Volume Master active whether this userscript was enabled or disabled.
+
+Keep this project only for a Firefox/Gecko build or fork where you can reproduce the original failure: YouTube enlarges the player, but browser chrome remains visible specifically while the selected tab is being shared. Even then, the helper acts only if that browser exposes a trustworthy, browser-owned selected-tab sharing marker through macOS Accessibility. Otherwise it intentionally performs a no-op.
+
 ### Verified Twilight behavior
 
 The following was tested manually on macOS on 2026-07-19:
@@ -58,11 +66,37 @@ The following was tested manually on macOS on 2026-07-19:
 | Userscript manager | Violentmonkey 2.41.0 |
 | Userscript | YouTube Real Fullscreen for Shared Tabs 1.1.0, enabled and injected after a YouTube reload |
 | Volume add-on | Volume Master — Increase Volume 1.0.1 from Mozilla Add-ons |
-| Amplification | 200% |
+| Initial amplification setting | 200% |
 
 With amplification at 200%, YouTube entered genuine browser fullscreen: Twilight removed its normal window/sidebar controls, exposed `YouTube Video Player in Fullscreen`, and restored the prior window after `f` was pressed again. Twilight did not expose a browser-owned selected-tab sharing marker in macOS Accessibility. The helper therefore stayed fail-closed while Twilight's native fullscreen implementation succeeded normally. This is a passing result, not an error: the bridge is only needed in browsers where active sharing blocks the native transition.
 
-## Why the userscript is required
+A second fullscreen test disabled only **YouTube Real Fullscreen for Shared Tabs** in Violentmonkey, loaded a fresh YouTube document, and set Volume Master to 240%. Twilight still entered the same chrome-free native fullscreen. This verifies that Twilight's native fullscreen did **not** depend on this userscript.
+
+The audio behavior was then tested objectively with BlackHole 2ch 0.7.1. Twilight's output was routed directly to BlackHole, the YouTube player volume was held at 44%, and four matched 8-second windows were recorded from the same video and timestamp. The userscript state was explicitly changed and saved in Violentmonkey before each pair; the Volume Master popup was checked at 100% or 240% before each recording.
+
+| Userscript | Volume Master | Mean level | Peak level | Change from that script state's 100% sample |
+| --- | ---: | ---: | ---: | ---: |
+| Disabled | 100% | -26.6 dB | -9.4 dB | baseline |
+| Disabled | 240% | -20.2 dB | -1.8 dB | +6.4 dB mean / +7.6 dB peak |
+| Enabled | 100% | -26.4 dB | -9.4 dB | baseline |
+| Enabled | 240% | -18.8 dB | -1.8 dB | +7.6 dB mean / +7.6 dB peak |
+
+A 2.4× amplitude multiplier has an expected gain of about 7.6 dB. Both script states produced that peak increase, both 100% baselines were effectively identical, and both 240% samples reached the same peak. The initial enabled 240% window was nevertheless 1.4 dB higher in mean level than the disabled 240% window. Because that was the exact audible difference under investigation, it was not treated as conclusive.
+
+The 240% comparison was repeated with longer 25-second analysis windows, again resetting the same video to 2:00 and explicitly saving each userscript state. The longer windows remove most of the sensitivity to sub-second stream-start alignment:
+
+| Userscript | Volume Master | Mean level | Peak level |
+| --- | ---: | ---: | ---: |
+| Enabled | 240% | -17.8 dB | -1.8 dB |
+| Disabled | 240% | -17.8 dB | -1.8 dB |
+
+The replicated 240%-to-240% result was a 0.0 dB difference in both mean and peak level. The short-window 1.4 dB mean difference therefore did not repeat; it was sample-alignment/content variance, not a userscript-dependent gain. The result does **not** support the userscript as a cause of louder Volume Master output: at the same 240% setting, the longer enabled and disabled measurements were identical.
+
+The earlier apparent correlation came from test ordering. During the first loopback attempt the YouTube player had not actually begun playback, so BlackHole correctly recorded silence even though player controls and a Volume Master percentage were visible. Once playback was explicitly started, BlackHole captured the expected boost with the userscript disabled. A displayed percentage proves the requested slider setting, not that the media is currently playing.
+
+There is also no direct audio coupling in this project: the userscript never accesses `AudioContext`, `MediaStream`, gain nodes, media-element volume, or `tabCapture`, and the native helper only reads Accessibility state and changes the macOS window's fullscreen attribute.
+
+## Why the userscript is required when the bridge is needed
 
 The userscript runs at `document-start` on YouTube. It listens to the browser's standard `fullscreenchange` lifecycle, with legacy WebKit/Gecko event names retained as compatibility fallbacks.
 
@@ -369,7 +403,7 @@ Recommended matrix:
 Verified results in this repository version:
 
 - Helium + Violentmonkey + a Chromium tab-capture session: selected-tab sharing evidence was detected and the helper entered/restored the exact native window.
-- Twilight 1.22t + Violentmonkey + Volume Master 1.0.1 at 200%: Twilight entered and exited native YouTube fullscreen on its own; no selected-tab sharing marker was exposed, so the helper correctly performed a no-op.
+- Twilight 1.22t + Violentmonkey + Volume Master 1.0.1: Twilight entered and exited native YouTube fullscreen both with the userscript enabled at 200% and with it disabled at 240%. No selected-tab sharing marker was exposed, so the helper correctly performed a no-op. A subsequent BlackHole A/B test measured the expected Volume Master gain with the userscript both disabled and enabled; the replicated 25-second 240%-to-240% comparison measured identical -17.8 dB mean and -1.8 dB peak levels.
 
 ## Troubleshooting
 
@@ -401,6 +435,20 @@ launchctl kickstart -k "gui/$(id -u)/local.codex.youtube-real-fullscreen"
 ### Fullscreen immediately exits
 
 Confirm userscript version 1.1.0 is installed. The script includes the delayed exit check and generation guard required for native Space transition races.
+
+### Volume Master shows more than 100%, but audio is not louder
+
+Treat the displayed percentage as a requested setting, not proof that the video is currently producing audio. In the first Twilight loopback attempt, the player had not actually begun playback, so BlackHole captured silence even though the Volume Master setting was visible. After playback was explicitly started, an instrumented A/B test measured the expected boost with the fullscreen userscript both disabled and enabled.
+
+Try this sequence before diagnosing the fullscreen bridge:
+
+1. Exit YouTube fullscreen.
+2. Start video playback so the tab is producing audio.
+3. Open Volume Master for the active YouTube tab.
+4. Move the slider back to 100%, then to the desired value above 100% to force a fresh update.
+5. Confirm the boost audibly before entering fullscreen.
+
+If reloading YouTube makes the boost appear to disappear, first verify that the video clock is advancing and audio is actually playing. Then reopen Volume Master and move the slider again if needed. This project does not control Volume Master's audio path; it only handles the native-window fullscreen transition when the browser independently exposes selected-tab sharing evidence.
 
 ### Gecko reports no selected-tab sharing indicator
 
